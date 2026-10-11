@@ -1,0 +1,6 @@
+.venv/
+.venv-wsl/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+wordpress_sql_md_link_cache.json
