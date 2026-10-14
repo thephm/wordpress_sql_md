@@ -12,7 +12,7 @@ import wordpress_sql_md as converter
 
 
 class UrlHandlingTests(unittest.TestCase):
-    def test_wayback_rate_limit_retries_with_cooldown_and_caches_success(self):
+    def test_wayback_rate_limit_defers_without_sleep_or_retry(self):
         with tempfile.TemporaryDirectory() as directory:
             checker = converter.LinkChecker(Path(directory), True)
             checker.skip_links = False
@@ -22,17 +22,23 @@ class UrlHandlingTests(unittest.TestCase):
             with patch("wordpress_sql_md.urlopen") as request, \
                  patch("wordpress_sql_md.time.monotonic", return_value=100), \
                  patch("wordpress_sql_md.time.sleep") as sleep:
-                response = request.return_value
-                response.__enter__.return_value.read.return_value = b'{"archived_snapshots":{}}'
-                request.side_effect = [error, response]
+                request.side_effect = error
                 with self.assertLogs(level="WARNING"):
                     self.assertIsNone(checker.archive("http://example.com", "2005-01-02"))
-                sleep.assert_called_once_with(7)
-                self.assertEqual(request.call_count, 2)
-                self.assertEqual(checker.cache["archive:2005-01-02:http://example.com"],
-                                 {"url": None, "checked": True})
+                sleep.assert_not_called()
+                self.assertEqual(request.call_count, 1)
+                self.assertEqual(checker.wayback_rate_limit_until, 107)
                 checker.archive("http://example.com", "2005-01-02")
-                self.assertEqual(request.call_count, 2)
+                checker.archive("http://example.com/next", "2005-01-02")
+                self.assertEqual(request.call_count, 1)
+                sleep.assert_not_called()
+            pending = json.loads(checker.pending_path.read_text(encoding="utf-8"))
+            self.assertEqual(pending, [
+                {"url": "http://example.com", "date": "2005-01-02", "reason": "HTTP 429"},
+                {"url": "http://example.com/next", "date": "2005-01-02",
+                 "reason": "Wayback rate-limit cooldown"},
+            ])
+            self.assertNotIn("checked", checker.cache["archive:2005-01-02:http://example.com"])
 
     def test_wayback_api_failures_are_not_negative_cached(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -41,9 +47,11 @@ class UrlHandlingTests(unittest.TestCase):
             with patch("wordpress_sql_md.urlopen", side_effect=URLError("temporary")), \
                  self.assertLogs(level="WARNING"):
                 self.assertIsNone(checker.archive("http://example.com", "2005-01-02"))
-            self.assertNotIn("archive:2005-01-02:http://example.com", checker.cache)
+            entry = checker.cache["archive:2005-01-02:http://example.com"]
+            self.assertTrue(entry["pending"])
+            self.assertNotIn("checked", entry)
 
-    def test_wayback_repeated_rate_limit_keeps_cooldown_without_caching(self):
+    def test_wayback_deferred_lookup_is_rechecked_on_next_run(self):
         with tempfile.TemporaryDirectory() as directory:
             checker = converter.LinkChecker(Path(directory), True)
             checker.skip_links = False
@@ -53,10 +61,117 @@ class UrlHandlingTests(unittest.TestCase):
                  patch("wordpress_sql_md.time.sleep") as sleep, \
                  self.assertLogs(level="WARNING"):
                 self.assertIsNone(checker.archive("http://example.com", "2005-01-02"))
+                self.assertEqual(request.call_count, 1)
+                sleep.assert_not_called()
+            self.assertEqual(checker.wayback_rate_limit_until, 105)
+            with patch("wordpress_sql_md.shutil.which", return_value="curl"):
+                reloaded = converter.LinkChecker(Path(directory), False)
+            with patch("wordpress_sql_md.urlopen") as request:
+                request.return_value.__enter__.return_value.read.return_value = (
+                    b'{"archived_snapshots":{"closest":{"available":true,'
+                    b'"url":"https://web.archive.org/web/20050102/http://example.com"}}}'
+                )
+                self.assertEqual(
+                    reloaded.archive("http://example.com", "2005-01-02"),
+                    "https://web.archive.org/web/20050102/http://example.com",
+                )
+                request.assert_called_once()
+                reloaded.archive("http://example.com", "2005-01-02")
+                request.assert_called_once()
+            reloaded.save()
+            self.assertEqual(json.loads(reloaded.pending_path.read_text(encoding="utf-8")), [])
+
+    def test_wayback_legacy_negative_cache_retries_and_caches_confirmed_absence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checker = converter.LinkChecker(Path(directory), True)
+            checker.skip_links = False
+            key = "archive:2005-01-02:http://example.com"
+            checker.cache[key] = {"url": None}
+            with patch("wordpress_sql_md.urlopen") as request:
+                request.return_value.__enter__.return_value.read.return_value = (
+                    b'{"archived_snapshots":{}}'
+                )
+                self.assertIsNone(checker.archive("http://example.com", "2005-01-02"))
+                self.assertEqual(checker.cache[key], {"url": None, "checked": True})
+                self.assertIsNone(checker.archive("http://example.com", "2005-01-02"))
+                request.assert_called_once()
+
+    def test_wayback_cooldown_expiry_only_allows_new_lookups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checker = converter.LinkChecker(Path(directory), True)
+            checker.skip_links = False
+            error = HTTPError("http://archive.org", 429, "rate limit", {}, None)
+            with patch("wordpress_sql_md.time.monotonic", return_value=100), \
+                 patch("wordpress_sql_md.urlopen", side_effect=error), \
+                 self.assertLogs(level="WARNING"):
+                checker.archive("http://example.com", "2005-01-02")
+            with patch("wordpress_sql_md.time.monotonic", return_value=106), \
+                 patch("wordpress_sql_md.time.sleep") as sleep, \
+                 patch("wordpress_sql_md.urlopen") as request:
+                request.return_value.__enter__.return_value.read.return_value = (
+                    b'{"archived_snapshots":{}}'
+                )
+                checker.archive("http://example.com", "2005-01-02")
+                request.assert_not_called()
+                checker.archive("http://example.com/other", "2005-01-02")
+                request.assert_called_once()
+                sleep.assert_not_called()
+
+    def test_wayback_retry_after_date_and_invalid_header_do_not_sleep(self):
+        for header, delay in (
+            ("Thu, 01 Jan 1970 00:01:50 GMT", 10),
+            ("invalid", 5),
+        ):
+            with self.subTest(header=header), tempfile.TemporaryDirectory() as directory:
+                checker = converter.LinkChecker(Path(directory), True)
+                checker.skip_links = False
+                error = HTTPError("http://archive.org", 429, "rate limit",
+                                  {"Retry-After": header}, None)
+                with patch("wordpress_sql_md.time.monotonic", return_value=100), \
+                     patch("wordpress_sql_md.time.time", return_value=100), \
+                     patch("wordpress_sql_md.time.sleep") as sleep, \
+                     patch("wordpress_sql_md.urlopen", side_effect=error) as request, \
+                     self.assertLogs(level="WARNING"):
+                    checker.archive("http://example.com", "2005-01-02")
+                    request.assert_called_once()
+                    sleep.assert_not_called()
+                self.assertEqual(checker.wayback_rate_limit_until, 100 + delay)
+
+    def test_wayback_normal_pacing_and_confirmed_absence_clear_pending(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checker = converter.LinkChecker(Path(directory), True)
+            checker.skip_links = False
+            checker._defer_archive("http://example.com", "2005-01-02", "HTTP 429")
+            with patch("wordpress_sql_md.shutil.which", return_value="curl"):
+                reloaded = converter.LinkChecker(Path(directory), False)
+            with patch("wordpress_sql_md.time.monotonic", return_value=100), \
+                 patch("wordpress_sql_md.time.sleep") as sleep, \
+                 patch("wordpress_sql_md.urlopen") as request:
+                request.return_value.__enter__.return_value.read.return_value = (
+                    b'{"archived_snapshots":{}}'
+                )
+                reloaded.archive("http://example.com", "2005-01-02")
+                sleep.assert_not_called()
+                reloaded.archive("http://example.com/other", "2005-01-02")
+                sleep.assert_called_once_with(1)
                 self.assertEqual(request.call_count, 2)
-                sleep.assert_called_once_with(5)
-            self.assertEqual(checker.wayback_next_request, 105)
-            self.assertNotIn("archive:2005-01-02:http://example.com", checker.cache)
+            reloaded.save()
+            self.assertEqual(json.loads(reloaded.pending_path.read_text(encoding="utf-8")), [])
+
+    def test_offline_leaves_wayback_pending_files_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pending_path = root / "wordpress_sql_md_wayback_pending.json"
+            cache_path = root / "wordpress_sql_md_link_cache.json"
+            pending_path.write_text("unchanged pending report", encoding="utf-8")
+            cache_path.write_text("unchanged cache", encoding="utf-8")
+            checker = converter.LinkChecker(root, True)
+            with patch("wordpress_sql_md.urlopen") as request:
+                self.assertIsNone(checker.archive("http://example.com", "2005-01-02"))
+                checker.save()
+                request.assert_not_called()
+            self.assertEqual(pending_path.read_text(encoding="utf-8"), "unchanged pending report")
+            self.assertEqual(cache_path.read_text(encoding="utf-8"), "unchanged cache")
 
     def test_dns_failure_is_remembered_without_retry_across_urls_and_runs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -300,6 +415,39 @@ class SqlParserTests(unittest.TestCase):
             tables = converter.parse_dump(dump)
         self.assertEqual(tables["wp_posts"][0]["post_title"], "Caf\u00e9 \u2014 \u20ac")
 
+    def test_parse_dump_reads_modern_taxonomy_tables(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dump = Path(directory) / "modern.sql"
+            dump.write_text(
+                "CREATE TABLE `wp_terms` (\n"
+                " `term_id` bigint(20),\n"
+                " `name` varchar(200),\n"
+                " `slug` varchar(200),\n"
+                " `term_group` bigint(10)\n"
+                ");\n"
+                "CREATE TABLE `wp_term_taxonomy` (\n"
+                " `term_taxonomy_id` bigint(20),\n"
+                " `term_id` bigint(20),\n"
+                " `taxonomy` varchar(32),\n"
+                " `description` longtext,\n"
+                " `parent` bigint(20),\n"
+                " `count` bigint(20)\n"
+                ");\n"
+                "CREATE TABLE `wp_term_relationships` (\n"
+                " `object_id` bigint(20),\n"
+                " `term_taxonomy_id` bigint(20),\n"
+                " `term_order` int(11)\n"
+                ");\n"
+                "INSERT INTO `wp_terms` VALUES (4,'News','news',0);\n"
+                "INSERT INTO `wp_term_taxonomy` VALUES (9,4,'category','',0,1);\n"
+                "INSERT INTO `wp_term_relationships` VALUES (7,9,0);",
+                encoding="utf-8",
+            )
+            tables = converter.parse_dump(dump)
+        self.assertEqual(tables["wp_terms"][0]["slug"], "news")
+        self.assertEqual(tables["wp_term_taxonomy"][0]["taxonomy"], "category")
+        self.assertEqual(tables["wp_term_relationships"][0]["object_id"], "7")
+
 
 class ConversionTests(unittest.TestCase):
     def test_title_filenames_preserve_case_spaces_and_remove_invalid_characters(self):
@@ -369,6 +517,40 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(len(posts), 1)
         self.assertEqual(posts[0].categories, ["news"])
         self.assertEqual([item.content for item in posts[0].comments], ["Earlier", "Later"])
+
+    def test_modern_taxonomy_tags_and_post_type_filtering(self):
+        tables = {
+            "wp_terms": [
+                {"term_id": "4", "slug": "news"},
+                {"term_id": "5", "slug": "python"},
+                {"term_id": "6", "slug": "main-menu"},
+            ],
+            "wp_term_taxonomy": [
+                {"term_taxonomy_id": "9", "term_id": "4", "taxonomy": "category"},
+                {"term_taxonomy_id": "10", "term_id": "5", "taxonomy": "post_tag"},
+                {"term_taxonomy_id": "11", "term_id": "6", "taxonomy": "nav_menu"},
+            ],
+            "wp_term_relationships": [
+                {"object_id": "7", "term_taxonomy_id": "9"},
+                {"object_id": "7", "term_taxonomy_id": "10"},
+                {"object_id": "7", "term_taxonomy_id": "11"},
+            ],
+            "wp_posts": [
+                {
+                    "ID": "7", "post_status": "publish", "post_type": "post",
+                    "post_date": "2018-03-30 14:20:00", "post_title": "A post",
+                },
+                {
+                    "ID": "8", "post_status": "publish", "post_type": "nav_menu_item",
+                    "post_date": "2018-03-30 14:20:00", "post_title": "",
+                },
+            ],
+        }
+        posts = converter._make_posts(tables)
+        self.assertEqual([post.id for post in posts], ["7"])
+        self.assertEqual(posts[0].categories, ["news", "python"])
+        with self.assertRaisesRegex(ValueError, "Unsupported WordPress schema version"):
+            converter._make_posts(tables, "unsupported")
 
     def test_person_matches_full_names_aliases_and_ignore(self):
         people = [

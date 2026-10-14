@@ -1,6 +1,6 @@
 # wordpress_sql_md
 
-Convert published posts from a legacy WordPress SQL dump into Markdown files using the `hal_md` post template. Posts are attributed to one configured person and can be linked to people in `People.json`.
+Convert published posts from a WordPress SQL dump into Markdown files using the `hal_md` post template. Posts are attributed to one configured person and can be linked to people in `People.json`.
 
 This converter is intended for personal blogs with a single author. Every post is attributed to the slug supplied with `-m`; posts written by other authors are not handled.
 
@@ -12,9 +12,9 @@ This converter is intended for personal blogs with a single author. Every post i
 - A WordPress SQL dump containing the supported tables. No MySQL server is needed; the converter parses the dump directly.
 - A configuration folder containing `People.json` (or `people.json`) and, optionally, `settings.json`.
 
-The SQL dump is decoded as UTF-8 first, with optional BOM support. If strict UTF-8 decoding fails, the entire dump is decoded as Windows-1252 (cp1252). Bytes undefined in Windows-1252 are replaced with the Unicode replacement character and reported as a warning. The sample dump uses this fallback. Encoding support does not imply support for newer WordPress schemas.
+The SQL dump is decoded as UTF-8 first, with optional BOM support. If strict UTF-8 decoding fails, the entire dump is decoded as Windows-1252 (cp1252). Bytes undefined in Windows-1252 are replaced with the Unicode replacement character and reported as a warning.
 
-When INSERT statements omit column names, the converter uses the dump's `CREATE TABLE` definitions to map values, allowing for differences between legacy WordPress schemas.
+When INSERT statements omit column names, the converter uses the dump's `CREATE TABLE` definitions to map values, allowing for differences between schemas. Taxonomies are read from either the legacy `wp_categories`/`wp_post2cat` tables or the modern `wp_terms`/`wp_term_taxonomy`/`wp_term_relationships` tables.
 
 ### WSL setup
 
@@ -44,11 +44,12 @@ The converter reads `settings.json` from the configuration folder; command-line 
 | `-s <folder>` | Source folder used to resolve a relative SQL dump path. |
 | `-o <folder>` | Override the configured output folder. |
 | `-d` | Print debug diagnostics. |
+| `--version <mode>` | Taxonomy schema: `auto` (default), `legacy`, or `modern`. Auto mode reads whichever supported taxonomy tables are present. |
 
 ## Converted content
 
-Only rows with `post_status = 'publish'` are converted. Attachments are not
-written as posts; they may instead be downloaded when referenced by a post.
+Only published rows with an empty or `post` post type are converted.
+Attachments are not written as posts; they may instead be downloaded when referenced by a post.
 Static pages, drafts, private posts, users, links, and WordPress options other
 than `siteurl` are out of scope.
 
@@ -62,7 +63,7 @@ Windows-invalid filename characters and trailing dots/spaces are removed.
 Empty cleaned titles or case-insensitive filename collisions are reported as
 errors rather than silently overwriting posts. Its frontmatter contains:
 
-- `tags`: `post` and the post's category nicenames, excluding `uncategorized`.
+- `tags`: `post`, category nicenames and (for modern schemas) post-tag slugs, excluding `uncategorized`.
 - `url`: the site's `/?p=<ID>` URL.
 - `date` and `time`: the stored `post_date` value, with no GMT conversion.
 - `people`: the `-m` slug and any matched people.
@@ -105,14 +106,23 @@ Live images and attachments referenced in posts are downloaded to the configured
 
 With `--skip-links`, tracking/session cleanup and local post-link rewrites still
 apply. There are no dead-link markers, Wayback substitutions, or downloads, and
-the link cache is not read or written.
+the link cache and deferred Wayback list are not read or written.
 
 ## Run output
 
-Wayback requests are paced at least one second apart after completion. HTTP
-429 responses honor `Retry-After` (or a five-second fallback) and retry once.
-Failed API requests are not cached as missing snapshots. Legacy negative
-archive cache entries are retried because they may represent earlier failures.
+Wayback requests are normally paced at least one second apart after completion.
+On HTTP 429, the converter moves on without waiting or retrying that lookup.
+Further lookups during `Retry-After` (or a five-second fallback) are deferred
+without making a request. Failed API lookups and those skipped during cooldown
+are saved immediately to the link cache as pending, not as missing snapshots.
+A deduplicated report, `wordpress_sql_md_wayback_pending.json`, is saved at the
+output root with each URL, post date, and reason; its count and location are
+printed at the end. The link cache is the authoritative pending state.
+Rerunning the conversion with link checks enabled retries pending lookups as
+their URLs are encountered, removing them from the report after a successful
+API response (whether or not a snapshot exists). A deferred URL/date pair is
+not retried again in the same run. Legacy negative archive cache entries are
+also retried because they may represent earlier failures.
 
 Images that cannot be downloaded, including dead images without a Wayback
 snapshot, use `![[<my-slug>/<media-subfolder>/<original-filename>]]`.

@@ -14,19 +14,17 @@ It is built for personal blogs with a single author: every post is attributed to
 
 The input is one `.sql` dump, passed as a positional argument. The tool parses the `INSERT` statements itself; no MySQL server is needed.
 
-- **Tables read:** `wp_posts`, `wp_comments`, `wp_categories`, `wp_post2cat`, `wp_postmeta` and `wp_options` (for `siteurl`).
+- **Tables read:** `wp_posts`, `wp_comments`, `wp_postmeta` and `wp_options` (for `siteurl`), plus either legacy `wp_categories`/`wp_post2cat` or modern `wp_terms`/`wp_term_taxonomy`/`wp_term_relationships` taxonomy tables.
 - **Escaping:** the parser handles `''` and backslash escapes, literal `\r\n`, and values that span lines (comments do).
-- **Encoding:** try strict UTF-8 first, accepting and removing an optional UTF-8 BOM. If decoding fails, fall back to cp1252 for the entire dump. In the cp1252 fallback, undefined bytes are replaced with � and reported as a warning instead of aborting. The sample dump uses this fallback. UTF-8 input support does not extend support to newer WordPress schemas.
+- **Encoding:** try strict UTF-8 first, accepting and removing an optional UTF-8 BOM. If decoding fails, fall back to cp1252 for the entire dump. In the cp1252 fallback, undefined bytes are replaced with � and reported as a warning instead of aborting.
 
 * **INSERT styles:** both one row per `INSERT` (as in the sample dump) and extended inserts, with many `(...)` tuples in one `VALUES` list, are supported. With a column list (`INSERT INTO t (a, b) VALUES ...`) values are mapped by column name; without one they are mapped by the column order in the dump's own `CREATE TABLE` statement. `INSERT` statements for tables the tool does not read are skipped.
 
-**WordPress version.** The dump has no `wp_version` string, so the tool reads `db_version` from `wp_options`. The sample dump has `db_version = 3437`, which the WordPress changeset history ties to the early 2.0.x series (2.0.1 or later); the exact point release cannot be determined from the number alone. The tool is written and tested only against this schema: `wp_categories` and `wp_post2cat`, no `wp_terms`, no WordPress tags.
-
-At startup the tool prints one line, for example `WordPress db_version 3437`. It warns, and continues, if `db_version` is missing or if a `wp_terms` table exists, because later schemas store categories and tags differently and the tool does not handle them.
+**Taxonomy schema.** The tool automatically reads the legacy `wp_categories`/`wp_post2cat` layout or the modern `wp_terms`/`wp_term_taxonomy`/`wp_term_relationships` layout. Use `--version legacy` or `--version modern` to select one explicitly; the default is `--version auto`. Modern `category` and `post_tag` taxonomies become frontmatter tags; other taxonomies are ignored.
 
 ## Selection and output files
 
-Only posts with `post_status = 'publish'` are converted (111). The dump also holds 12 attachments, 1 static page, 1 private post and 1 draft, none of which are converted. `post_type` is empty throughout, so `post_status` is the only discriminator.
+Only published posts are converted: rows must have `post_status = 'publish'` and an empty or `post` `post_type`. Attachments, menu items, pages, private posts and drafts are not converted.
 
 Each post becomes one file named `YYYY-MM-DD <post_title>.md`, preserving the original title's capitalization (including CamelCase) and spaces rather than using the hyphenated `post_name`. Remove Windows-invalid characters (`< > : " / \ | ? *` and control characters), trim surrounding whitespace and remove trailing dots/spaces. Report an error before writing posts if a cleaned title is empty or filenames collide case-insensitively; do not silently overwrite posts. Files go under `<output-folder>/<people-subfolder>/<my-slug>/` (default `People/<my-slug>`).
 
@@ -41,7 +39,7 @@ and times. `date` and `time` remain quoted to preserve their string values.
 
 | Field | Source |
 | --- | --- |
-| `tags` | `post` plus the category nicenames from `wp_post2cat` and `wp_categories`, excluding `uncategorized` (case-insensitive) |
+| `tags` | `post` plus category nicenames (legacy or modern taxonomy) and modern `post_tag` slugs, excluding `uncategorized` (case-insensitive) |
 | `url` | `siteurl` + `/?p=<ID>`, preserving the functional `p` parameter (`permalink_structure` is empty and `guid` is unset). Frontmatter retains the original external post URL, not a local wikilink. |
 | `date` | `post_date`, as `YYYY-MM-DD` |
 | `time` | `post_date`, as `HH:MM` in 24 h with no seconds |
@@ -60,7 +58,7 @@ The body starts with `# <post_title>`, followed by `post_content` converted from
 
 ## Categories and comments
 
-Categories become `tags` in the frontmatter (see Frontmatter), except for `uncategorized`, which is omitted case-insensitively. The `post` tag is always retained, even when no other categories remain. The dump has no WordPress tags.
+Categories become `tags` in the frontmatter (see Frontmatter), except for `uncategorized`, which is omitted case-insensitively. In modern taxonomy dumps, WordPress post tags are included too; unrelated taxonomies are ignored. The `post` tag is always retained, even when no other categories remain.
 
 Approved comments are appended under a `## Comments` heading.
 
@@ -110,7 +108,7 @@ Links and attachments that still work are kept. Validation runs `curl` from the 
 
 - `HEAD` request, falling back to `GET` on 403 or 405. Follow redirects, 3 s timeout per request, one retry.
 - The 3 s limit applies to link validation. Media downloads and Wayback API requests have separate 10 s timeouts.
-- Pace Wayback API requests globally, waiting at least 1 s after each request finishes. On HTTP 429, respect `Retry-After` (seconds or HTTP date), or wait 5 s if it is absent or invalid, then retry once. If the retry is also rate-limited, retain the cooldown for the next lookup. Warn explicitly on API failures and never cache them as "no snapshot." Cache negative results only after a valid successful availability response. Recheck legacy negative cache entries that cannot distinguish API failures from successful empty responses; retain positive entries.
+- Pace normal Wayback API requests globally, waiting at least 1 s after each request finishes. On HTTP 429, move on without sleeping or retrying. Respect `Retry-After` (seconds or HTTP date), with a 5 s fallback when absent or invalid, by deferring further lookups during that cooldown without making requests. Warn explicitly on API failures and save them as pending, never as "no snapshot." Keep a deduplicated URL/date/reason report at `<output-folder>/wordpress_sql_md_wayback_pending.json`, saved immediately alongside the authoritative link cache. Print its count and location at the end of a run. Pending lookups are retried when encountered in a subsequent online conversion, never again in the same run; a successful API response removes the pending entry. Cache negative results only after a valid successful availability response. Recheck legacy negative cache entries that cannot distinguish API failures from successful empty responses; retain positive entries.
 - A URL is live if the final status is 2xx. For attachments and images, a `Content-Type` of `text/html` counts as dead, which catches parked domains and soft 404s.
 - Throttle per host and cache results in a JSON file so reruns skip checked URLs.
 - If curl reports a hostname-resolution failure (exit code 6), mark that exact hostname unresolved in the JSON cache immediately. Do not retry DNS failures; skip further validation of URLs on that hostname, across paths, HTTP/HTTPS and ports, both during the run and on reruns. Print one warning when recording a newly unresolved hostname, not one warning per URL. Subdomains are tracked independently; failure of `pics.nakama.ca` does not prove that `nakama.ca` or another subdomain is unavailable.
@@ -127,7 +125,7 @@ Links and attachments that still work are kept. Validation runs `curl` from the 
 
 **`--skip-links`**
 
-Skips all curl and Wayback checks. Known tracking and session parameters are still removed and links to converted posts are still rewritten locally. Other links and images retain their cleaned source URLs, with no `(dead)` markers, no archive substitutions and no downloads. The cache file is neither read nor written.
+Skips all curl and Wayback checks. Known tracking and session parameters are still removed and links to converted posts are still rewritten locally. Other links and images retain their cleaned source URLs, with no `(dead)` markers, no archive substitutions and no downloads. The cache and deferred Wayback list are neither read nor written.
 
 ## CLI and configuration
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert published posts from a legacy WordPress SQL dump to Markdown."""
+"""Convert published posts from a WordPress SQL dump to Markdown."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ TRACKING_PARAMETERS = {
     "sessionid", "session_id", "fbclid", "gclid", "dclid", "msclkid",
 }
 
-LEGACY_COLUMNS = {
+SUPPORTED_TABLE_COLUMNS = {
     "wp_posts": [
         "ID", "post_author", "post_date", "post_date_gmt", "post_content",
         "post_title", "post_category", "post_excerpt", "post_lat", "post_lon",
@@ -63,6 +63,11 @@ LEGACY_COLUMNS = {
         "category_parent",
     ],
     "wp_post2cat": ["rel_id", "post_id", "category_id"],
+    "wp_terms": ["term_id", "name", "slug", "term_group"],
+    "wp_term_taxonomy": [
+        "term_taxonomy_id", "term_id", "taxonomy", "description", "parent", "count",
+    ],
+    "wp_term_relationships": ["object_id", "term_taxonomy_id", "term_order"],
     "wp_postmeta": ["meta_id", "post_id", "meta_key", "meta_value"],
     "wp_options": [
         "option_id", "blog_id", "option_name", "option_can_override",
@@ -274,7 +279,7 @@ def parse_insert(
     if not match:
         return None
     table = match.group(1).lower()
-    if table not in LEGACY_COLUMNS:
+    if table not in SUPPORTED_TABLE_COLUMNS:
         return None
     values_match = re.search(r"\bVALUES?\b", statement[match.end():], re.IGNORECASE)
     if not values_match:
@@ -284,7 +289,7 @@ def parse_insert(
     columns = (
         _parse_columns(prefix)
         or (schemas or {}).get(table)
-        or LEGACY_COLUMNS.get(table, [])
+        or SUPPORTED_TABLE_COLUMNS.get(table, [])
     )
     values = statement[values_start:].strip().removesuffix(";")
     rows: list[dict[str, Any]] = []
@@ -333,14 +338,16 @@ def parse_dump(path: Path) -> dict[str, list[dict[str, Any]]]:
             statement,
             re.IGNORECASE | re.MULTILINE,
         )
-        if definition and definition.group(1).lower() in LEGACY_COLUMNS:
+        if definition and definition.group(1).lower() in SUPPORTED_TABLE_COLUMNS:
+            table = definition.group(1).lower()
             columns = re.findall(
                 r"^\s*`([^`]+)`\s+\w+", statement[definition.end():],
                 re.MULTILINE,
             )
             if not columns:
                 raise ValueError(f"No columns found in CREATE TABLE {definition.group(1)}")
-            schemas[definition.group(1).lower()] = columns
+            schemas[table] = columns
+            tables.setdefault(table, [])
     for statement in statements:
         parsed = parse_insert(statement, schemas)
         if parsed:
@@ -469,9 +476,12 @@ class LinkChecker:
         self.skip_links = skip_links
         self.debug = debug
         self.cache_path = output_folder / "wordpress_sql_md_link_cache.json"
+        self.pending_path = output_folder / "wordpress_sql_md_wayback_pending.json"
         self.cache: dict[str, Any] = {}
         self.host_last_request: dict[str, float] = {}
         self.wayback_next_request = 0.0
+        self.wayback_rate_limit_until = 0.0
+        self.wayback_deferred: set[str] = set()
         self.curl = shutil.which("curl")
         if not skip_links and not self.curl:
             raise FileNotFoundError("curl is required to validate links; use --skip-links offline")
@@ -591,6 +601,14 @@ class LinkChecker:
         self.cache[url] = result
         return result
 
+    def _defer_archive(self, url: str, date: str, reason: str) -> None:
+        key = f"archive:{date}:{url}"
+        self.cache[key] = {
+            "pending": True, "source_url": url, "date": date, "reason": reason,
+        }
+        self.wayback_deferred.add(key)
+        self.save()
+
     def archive(self, url: str, date: str) -> str | None:
         url = clean_url(url)
         if self.skip_links:
@@ -599,6 +617,11 @@ class LinkChecker:
         cached = self.cache.get(key)
         if isinstance(cached, dict) and (cached.get("url") or cached.get("checked")):
             return clean_url(cached["url"]) if cached.get("url") else None
+        if key in self.wayback_deferred:
+            return None
+        if time.monotonic() < self.wayback_rate_limit_until:
+            self._defer_archive(url, date, "Wayback rate-limit cooldown")
+            return None
         self.cache.pop(key, None)
         timestamp = date.replace("-", "")
         query = urlencode({"url": url, "timestamp": timestamp})
@@ -606,46 +629,44 @@ class LinkChecker:
             f"https://archive.org/wayback/available?{query}",
             headers={"User-Agent": "wordpress_sql_md/1.0"},
         )
-        for attempt in range(2):
-            wait = self.wayback_next_request - time.monotonic()
-            if wait > 0:
-                time.sleep(wait)
-            try:
-                with urlopen(request, timeout=10) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                if not isinstance(payload, dict) or not isinstance(
-                    payload.get("archived_snapshots"), dict
-                ):
-                    raise ValueError("Invalid Wayback availability response")
-                break
-            except HTTPError as error:
-                if error.code == 429:
-                    retry_after = error.headers.get("Retry-After", "") if error.headers else ""
-                    delay = 5.0
-                    if retry_after:
+        wait = self.wayback_next_request - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            with urlopen(request, timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, dict) or not isinstance(
+                payload.get("archived_snapshots"), dict
+            ):
+                raise ValueError("Invalid Wayback availability response")
+        except HTTPError as error:
+            if error.code == 429:
+                retry_after = error.headers.get("Retry-After", "") if error.headers else ""
+                delay = 5.0
+                if retry_after:
+                    try:
+                        delay = max(0.0, float(int(retry_after)))
+                    except ValueError:
                         try:
-                            delay = max(0.0, float(int(retry_after)))
-                        except ValueError:
-                            try:
-                                delay = max(0.0, parsedate_to_datetime(retry_after).timestamp() - time.time())
-                            except (ValueError, TypeError, OverflowError):
-                                logging.warning("Invalid Wayback Retry-After header: %r", retry_after)
-                    self.wayback_next_request = time.monotonic() + max(1.0, delay)
-                    logging.warning("Wayback rate-limited %s; waiting %.0f s before %s",
-                                    url, max(1.0, delay),
-                                    "one retry" if attempt == 0 else "the next lookup")
-                    if attempt == 0:
-                        continue
-                else:
-                    logging.warning("Wayback lookup failed for %s: %s", url, error)
-                return None
-            except (URLError, TimeoutError, ValueError, UnicodeDecodeError) as error:
-                logging.warning("Wayback lookup failed for %s: %s", url, error)
-                return None
-            finally:
-                self.wayback_next_request = max(
-                    self.wayback_next_request, time.monotonic() + 1.0
+                            delay = max(0.0, parsedate_to_datetime(retry_after).timestamp() - time.time())
+                        except (ValueError, TypeError, OverflowError):
+                            logging.warning("Invalid Wayback Retry-After header: %r", retry_after)
+                self.wayback_rate_limit_until = time.monotonic() + max(1.0, delay)
+                logging.warning(
+                    "Wayback rate-limited %s; deferring without retry "
+                    "(lookups during the next %.0f s will also be deferred)",
+                    url, max(1.0, delay),
                 )
+            else:
+                logging.warning("Wayback lookup failed for %s: %s", url, error)
+            self._defer_archive(url, date, f"HTTP {error.code}")
+            return None
+        except (URLError, TimeoutError, ValueError, UnicodeDecodeError) as error:
+            logging.warning("Wayback lookup failed for %s: %s", url, error)
+            self._defer_archive(url, date, str(error))
+            return None
+        finally:
+            self.wayback_next_request = time.monotonic() + 1.0
         snapshot = payload.get("archived_snapshots", {}).get("closest", {})
         snapshot_url = snapshot.get("url") if snapshot.get("available") else None
         if snapshot_url:
@@ -662,6 +683,17 @@ class LinkChecker:
             json.dumps(self.cache, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         temporary_path.replace(self.cache_path)
+        pending = [
+            {"url": entry["source_url"], "date": entry["date"], "reason": entry["reason"]}
+            for entry in self.cache.values()
+            if isinstance(entry, dict) and entry.get("pending") is True
+        ]
+        if pending or self.pending_path.exists():
+            temporary_path = self.pending_path.with_suffix(".tmp")
+            temporary_path.write_text(
+                json.dumps(pending, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            temporary_path.replace(self.pending_path)
 
 
 class MediaStore:
@@ -973,20 +1005,51 @@ def _post_datetime(date_string: str) -> tuple[str, str]:
     return match.group(1), match.group(2)
 
 
-def _make_posts(tables: dict[str, list[dict[str, Any]]]) -> list[Post]:
-    categories = {
-        _value(row, "cat_ID"): _value(row, "category_nicename")
-        for row in tables.get("wp_categories", [])
-    }
+def _make_posts(
+    tables: dict[str, list[dict[str, Any]]], version: str = "auto"
+) -> list[Post]:
     post_categories: dict[str, list[str]] = {}
-    for relation in tables.get("wp_post2cat", []):
-        category = categories.get(_value(relation, "category_id"))
-        if category:
-            post_categories.setdefault(_value(relation, "post_id"), []).append(category)
+    if version not in {"auto", "legacy", "modern"}:
+        raise ValueError(f"Unsupported WordPress schema version: {version}")
+
+    if version in {"auto", "legacy"}:
+        categories = {
+            _value(row, "cat_ID"): _value(row, "category_nicename")
+            for row in tables.get("wp_categories", [])
+        }
+        for relation in tables.get("wp_post2cat", []):
+            category = categories.get(_value(relation, "category_id"))
+            if category:
+                post_categories.setdefault(_value(relation, "post_id"), []).append(category)
+
+    if version in {"auto", "modern"}:
+        terms = {
+            _value(row, "term_id"): _value(row, "slug")
+            for row in tables.get("wp_terms", [])
+        }
+        taxonomies = {
+            _value(row, "term_taxonomy_id"): (
+                _value(row, "term_id"), _value(row, "taxonomy")
+            )
+            for row in tables.get("wp_term_taxonomy", [])
+        }
+        for relation in tables.get("wp_term_relationships", []):
+            term_id, taxonomy = taxonomies.get(
+                _value(relation, "term_taxonomy_id"), ("", "")
+            )
+            if taxonomy in {"category", "post_tag"}:
+                slug = terms.get(term_id)
+                if slug:
+                    post_categories.setdefault(
+                        _value(relation, "object_id"), []
+                    ).append(slug)
 
     posts: list[Post] = []
     for row in tables.get("wp_posts", []):
-        if _value(row, "post_status") != "publish":
+        if (
+            _value(row, "post_status") != "publish"
+            or _value(row, "post_type").strip().casefold() not in {"", "post"}
+        ):
             continue
         post_id = _value(row, "ID")
         date, post_time = _post_datetime(_value(row, "post_date"))
@@ -1183,6 +1246,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-c", "--config", default=".", help="Folder containing settings.json and People.json")
     parser.add_argument("-s", "--source-folder", default=".", help="Folder containing the SQL dump")
     parser.add_argument("-o", "--output-folder", help="Override output-folder setting")
+    parser.add_argument(
+        "--version", choices=("auto", "legacy", "modern"), default="auto",
+        help="WordPress taxonomy schema (default: auto-detect from dump tables)",
+    )
     parser.add_argument("-d", "--debug", action="store_true", help="Print debug diagnostics")
     parser.add_argument("--skip-links", action="store_true", help="Skip all link checks and downloads")
     return parser
@@ -1235,7 +1302,7 @@ def _run(args: argparse.Namespace) -> None:
     if not siteurl:
         raise ValueError("The SQL dump has no wp_options siteurl value")
 
-    posts = _make_posts(tables)
+    posts = _make_posts(tables, args.version)
     if not posts:
         raise ValueError("The SQL dump contains no published posts")
     post_file_targets(posts)
@@ -1246,7 +1313,10 @@ def _run(args: argparse.Namespace) -> None:
 
     attachment_urls: dict[str, str] = {}
     for row in tables.get("wp_posts", []):
-        if _value(row, "post_status") != "attachment":
+        if (
+            _value(row, "post_type").strip().casefold() != "attachment"
+            and _value(row, "post_status").strip().casefold() != "attachment"
+        ):
             continue
         post_id = _value(row, "ID")
         for meta in tables.get("wp_postmeta", []):
@@ -1272,6 +1342,13 @@ def _run(args: argparse.Namespace) -> None:
             logging.debug("Wrote %s", filename)
 
     checker.save()
+    if not args.skip_links and checker.pending_path.exists():
+        pending = sum(
+            isinstance(entry, dict) and entry.get("pending") is True
+            for entry in checker.cache.values()
+        )
+        if pending:
+            print(f"Deferred Wayback lookups: {pending} (saved to {checker.pending_path})")
     missing = _missing_commenters(posts, people, me_slug)
     if missing:
         print("Missing people:")
